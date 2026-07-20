@@ -18,8 +18,10 @@
 #include "rapidjson/internal/dtoa.h"
 #include "rapidjson/internal/itoa.h"
 #include "rapidjson/memorystream.h"
+#include "rapidjson/stringbuffer.h"
 
 #include <limits>
+#include <vector>
 
 using namespace rapidjson;
 
@@ -893,6 +895,155 @@ TEST(Reader, ParseString_NonDestructive) {
     reader.Parse(s, h);
     EXPECT_EQ(0, StrCmp("Hello\nWorld", h.str_));
     EXPECT_EQ(11u, h.length_);
+}
+
+template <typename Encoding>
+struct ChunkedStringHandler : BaseReaderHandler<Encoding, ChunkedStringHandler<Encoding> > {
+    typedef typename Encoding::Ch Ch;
+    typedef GenericStringBuffer<Encoding> ChunkedStringSinkType;
+
+    ChunkedStringHandler() : sink_(), chunked_(), accepts_(true), chunkedReturn_(true), chunkedCount_(0), stringCount_(0), keyCount_(0) {}
+
+    ChunkedStringHandler(const ChunkedStringHandler&);
+    ChunkedStringHandler& operator=(const ChunkedStringHandler&);
+
+    bool AcceptsChunkedString() const { return accepts_; }
+    ChunkedStringSinkType& ChunkedStringSink() {
+        sink_.Clear();
+        return sink_;
+    }
+    bool ChunkedString(SizeType length) {
+        // The sink receives the decoded string plus a '\0' terminator;
+        // length excludes the terminator.
+        EXPECT_EQ(static_cast<size_t>(length) + 1, sink_.GetLength());
+        EXPECT_EQ(Ch('\0'), sink_.GetString()[length]);
+        chunked_.assign(sink_.GetString(), sink_.GetString() + length);
+        chunkedCount_++;
+        return chunkedReturn_;
+    }
+
+    bool String(const Ch*, SizeType, bool) { stringCount_++; return true; }
+    bool Key(const Ch*, SizeType, bool) { keyCount_++; return true; }
+    bool Default() { return true; }
+
+    ChunkedStringSinkType sink_;
+    std::vector<Ch> chunked_;
+    bool accepts_;
+    bool chunkedReturn_;
+    unsigned chunkedCount_;
+    unsigned stringCount_;
+    unsigned keyCount_;
+};
+
+template <typename Encoding>
+static void TestChunkedString(const typename Encoding::Ch* e, const typename Encoding::Ch* x) {
+    GenericStringStream<Encoding> s(x);
+    ChunkedStringHandler<Encoding> h;
+    GenericReader<Encoding, Encoding> reader;
+    reader.Parse(s, h);
+    EXPECT_FALSE(reader.HasParseError());
+    EXPECT_EQ(1u, h.chunkedCount_);
+    EXPECT_EQ(0u, h.stringCount_);
+    EXPECT_EQ(StrLen(e), h.chunked_.size());
+    EXPECT_TRUE(h.chunked_.empty() || memcmp(e, &h.chunked_[0], h.chunked_.size() * sizeof(typename Encoding::Ch)) == 0);
+}
+
+TEST(Reader, ParseString_ChunkedSink) {
+    // String values are decoded into the handler-provided sink and delivered
+    // via ChunkedString(); String() is not called.
+    TestChunkedString<UTF8<> >("", "\"\"");
+    TestChunkedString<UTF8<> >("Hello", "\"Hello\"");
+    TestChunkedString<UTF8<> >("Hello\nWorld", "\"Hello\\nWorld\"");
+    TestChunkedString<UTF8<> >("\"\\/\b\f\n\r\t", "\"\\\"\\\\/\\b\\f\\n\\r\\t\"");
+    TestChunkedString<UTF8<> >("\x24", "\"\\u0024\"");         // Dollar sign U+0024
+    TestChunkedString<UTF8<> >("\xC2\xA2", "\"\\u00A2\"");     // Cents sign U+00A2
+    TestChunkedString<UTF8<> >("\xE2\x82\xAC", "\"\\u20AC\""); // Euro sign U+20AC
+    TestChunkedString<UTF8<> >("\xF0\x9D\x84\x9E", "\"\\uD834\\uDD1E\"");  // G clef sign U+1D11E
+
+    // Support of null character in string
+    {
+        StringStream s("\"Hello\\u0000World\"");
+        ChunkedStringHandler<UTF8<> > h;
+        Reader reader;
+        reader.Parse(s, h);
+        EXPECT_FALSE(reader.HasParseError());
+        EXPECT_EQ(11u, h.chunked_.size());
+        EXPECT_EQ(0, memcmp("Hello\0World", &h.chunked_[0], 11));
+    }
+}
+
+TEST(Reader, ParseString_ChunkedSink_KeysUseStack) {
+    StringStream s("{\"key\":\"value\"}");
+    ChunkedStringHandler<UTF8<> > h;
+    Reader reader;
+    reader.Parse(s, h);
+    EXPECT_FALSE(reader.HasParseError());
+    EXPECT_EQ(1u, h.keyCount_);
+    EXPECT_EQ(1u, h.chunkedCount_);
+    EXPECT_EQ(0u, h.stringCount_);
+}
+
+TEST(Reader, ParseString_ChunkedSink_DynamicOptOut) {
+    StringStream s("\"Hello\"");
+    ChunkedStringHandler<UTF8<> > h;
+    h.accepts_ = false;
+    Reader reader;
+    reader.Parse(s, h);
+    EXPECT_FALSE(reader.HasParseError());
+    EXPECT_EQ(0u, h.chunkedCount_);
+    EXPECT_EQ(1u, h.stringCount_);
+}
+
+TEST(Reader, ParseString_ChunkedSink_Termination) {
+    StringStream s("\"Hello\"");
+    ChunkedStringHandler<UTF8<> > h;
+    h.chunkedReturn_ = false;
+    Reader reader;
+    reader.Parse(s, h);
+    EXPECT_TRUE(reader.HasParseError());
+    EXPECT_EQ(kParseErrorTermination, reader.GetParseErrorCode());
+}
+
+TEST(Reader, ParseString_ChunkedSink_Error) {
+    StringStream s("\"\\q\"");
+    ChunkedStringHandler<UTF8<> > h;
+    Reader reader;
+    reader.Parse(s, h);
+    EXPECT_TRUE(reader.HasParseError());
+    EXPECT_EQ(kParseErrorStringEscapeInvalid, reader.GetParseErrorCode());
+    EXPECT_EQ(0u, h.chunkedCount_);
+}
+
+TEST(Reader, ParseString_ChunkedSink_Transcoding) {
+    GenericStringStream<UTF8<> > is("\"Hello\"");
+    GenericReader<UTF8<>, UTF16<> > reader;
+    ChunkedStringHandler<UTF16<> > h;
+    reader.Parse(is, h);
+    EXPECT_FALSE(reader.HasParseError());
+    EXPECT_EQ(1u, h.chunkedCount_);
+    EXPECT_EQ(StrLen(L"Hello"), h.chunked_.size());
+    EXPECT_EQ(0, memcmp(L"Hello", &h.chunked_[0], 5 * sizeof(UTF16<>::Ch)));
+}
+
+TEST(Reader, ParseString_ChunkedSink_InsituTakesPrecedence) {
+    char buffer[] = "\"Hello\\nWorld\"";
+    InsituStringStream s(buffer);
+    ChunkedStringHandler<UTF8<> > h;
+    Reader reader;
+    reader.Parse<kParseInsituFlag>(s, h);
+    EXPECT_FALSE(reader.HasParseError());
+    EXPECT_EQ(0u, h.chunkedCount_);
+    EXPECT_EQ(1u, h.stringCount_);
+}
+
+TEST(Reader, ParseString_ChunkedSink_IterativeParsing) {
+    StringStream s("[\"Hello\\nWorld\"]");
+    ChunkedStringHandler<UTF8<> > h;
+    Reader reader;
+    reader.Parse<kParseIterativeFlag>(s, h);
+    EXPECT_FALSE(reader.HasParseError());
+    EXPECT_EQ(1u, h.chunkedCount_);
+    EXPECT_EQ(0u, h.stringCount_);
 }
 
 template <typename Encoding>

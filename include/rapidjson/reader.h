@@ -954,6 +954,41 @@ private:
         SizeType length_;
     };
 
+    // Detects whether Handler opts in to receiving string values through a
+    // handler-provided sink instead of the reader's contiguous stack, which
+    // avoids a large contiguous allocation for very large string values.
+    // An opting-in Handler must provide:
+    //   typedef ... ChunkedStringSinkType;      // output stream: Put(Ch), GetLength()
+    //   bool AcceptsChunkedString() const;      // dynamic, per-value opt-in
+    //   ChunkedStringSinkType& ChunkedStringSink(); // returns an empty sink
+    //   bool ChunkedString(SizeType length);    // consume sink contents
+    // The sink receives the decoded string followed by a '\0' terminator;
+    // length excludes the terminator.
+    template <typename T, typename V = void>
+    struct HandlerHasChunkedString : internal::FalseType {};
+    template <typename T>
+    struct HandlerHasChunkedString<T, typename internal::Void<typename T::ChunkedStringSinkType>::Type> : internal::TrueType {};
+
+    // Returns true if the string value was routed to the handler's sink
+    // (possibly with a parse error set); false to fall back to the stack.
+    template<unsigned parseFlags, typename InputStream, typename Handler>
+    bool ParseStringToChunkedSink(InputStream& s, Handler& handler, internal::TrueType) {
+        if (!handler.AcceptsChunkedString())
+            return false;
+        typename Handler::ChunkedStringSinkType& sink = handler.ChunkedStringSink();
+        ParseStringToStream<parseFlags, SourceEncoding, TargetEncoding>(s, sink);
+        RAPIDJSON_PARSE_ERROR_EARLY_RETURN(true);
+        SizeType length = static_cast<SizeType>(sink.GetLength()) - 1;
+        if (RAPIDJSON_UNLIKELY(!handler.ChunkedString(length)))
+            RAPIDJSON_PARSE_ERROR_NORETURN(kParseErrorTermination, s.Tell());
+        return true;
+    }
+
+    template<unsigned parseFlags, typename InputStream, typename Handler>
+    RAPIDJSON_FORCEINLINE bool ParseStringToChunkedSink(InputStream&, Handler&, internal::FalseType) {
+        return false;
+    }
+
     // Parse string and generate String event. Different code paths for kParseInsituFlag.
     template<unsigned parseFlags, typename InputStream, typename Handler>
     void ParseString(InputStream& is, Handler& handler, bool isKey = false) {
@@ -972,6 +1007,10 @@ private:
             RAPIDJSON_ASSERT(length <= 0xFFFFFFFF);
             const typename TargetEncoding::Ch* const str = reinterpret_cast<typename TargetEncoding::Ch*>(head);
             success = (isKey ? handler.Key(str, SizeType(length), false) : handler.String(str, SizeType(length), false));
+        }
+        else if (!isKey && ParseStringToChunkedSink<parseFlags>(s, handler, HandlerHasChunkedString<Handler>())) {
+            RAPIDJSON_PARSE_ERROR_EARLY_RETURN_VOID;
+            success = true;
         }
         else {
             StackStream<typename TargetEncoding::Ch> stackStream(stack_);
